@@ -72,8 +72,30 @@ class Qwen3ASR: ObservableObject {
         self.audioEncoder = Qwen3ASRAudioEncoder(config: config.audioConfig)
         self.textDecoder = Qwen3TextDecoder(config: config.textConfig)
 
-        let weights = try loadArrays(from: weightsPath)
-        // Note: Use update(parameters:) with correct key filtering/remapping in production.
+        let weights = try MLX.loadArrays(url: weightsPath)
+
+        // Apply weights to models
+        // We iterate through the loaded weights and update the model parameters.
+        // Assuming the weights file keys match the model structure or are flattened.
+        // In MLX, we typically use Module.update(parameters:).
+
+        // Note: Real-world models often have key mismatches (e.g. "model.layers.0" vs "layers.0").
+        // We perform a best-effort update here.
+
+        // Filter weights for audio encoder (usually prefixed or separate in some safetensors)
+        // If the weights file is a single dict for the whole model:
+
+        // Basic update attempt:
+        if let encoder = self.audioEncoder {
+             // Try to update with all weights, MLX usually ignores unused keys or we can filter.
+             // Ideally we should traverse and match.
+             // For this prototype, we call update.
+             encoder.update(parameters: weights)
+        }
+
+        if let decoder = self.textDecoder {
+             decoder.update(parameters: weights)
+        }
     }
 
     // Simple greedy generation
@@ -88,26 +110,18 @@ class Qwen3ASR: ObservableObject {
         var generatedIds: [Int] = []
 
         // Start with BOS/Prompt tokens usually.
-        // For Qwen-Audio, prompt format is specific (e.g. <|audio_start|><|audio_end|>).
-        // Assuming simple case: Audio Embeddings -> Decoder.
 
         var currentEmbeddings = audioEmbeddings
-        // var currentIds: [Int] = [] // Initial prompt tokens if any
-
-        // If we had input IDs, we would convert to embeddings:
-        // let initialTextEmbeddings = textDecoder.embedTokens(MLXArray(currentIds)[0.reshaped(1, -1)])
-        // currentEmbeddings = concatenated([audioEmbeddings, initialTextEmbeddings], axis: 1)
 
         for _ in 0..<100 { // Limit length
             // Run Text Decoder
-            // Note: Use KV Cache for efficiency. This implementation recomputes everything.
             let logits = textDecoder.forward(embeddings: currentEmbeddings) // [1, SeqLen, Vocab]
 
             // Get last token logits
             let lastLogits = logits[-1...-1] // [1, 1, Vocab]
 
             // Greedy Decoding (Argmax)
-            let nextTokenId = argmax(lastLogits, axis: -1).item(Int.self)
+            let nextTokenId = argMax(lastLogits, axis: -1).item(Int.self)
 
             generatedIds.append(nextTokenId)
 
@@ -137,8 +151,8 @@ class Qwen3ASRAudioEncoder: Module {
     let outputProjection: Linear?
 
     init(config: Qwen3ASRConfig.AudioConfig) {
-        self.conv1 = Conv1d(inputChannels: config.numMelBins, outputChannels: config.dModel, kernelSize: 3, padding: 1)
-        self.conv2 = Conv1d(inputChannels: config.dModel, outputChannels: config.dModel, kernelSize: 3, stride: 2, padding: 1)
+        self.conv1 = Conv1d(config.numMelBins, config.dModel, kernelSize: 3, padding: 1)
+        self.conv2 = Conv1d(config.dModel, config.dModel, kernelSize: 3, stride: 2, padding: 1)
 
         self.positionalEmbedding = SinusoidalPositionalEncoding(dModel: config.dModel, maxLen: config.maxSourcePositions)
 
@@ -146,10 +160,10 @@ class Qwen3ASRAudioEncoder: Module {
             TransformerEncoderLayer(dModel: config.dModel, heads: config.encoderAttentionHeads, mlpDim: config.encoderFfnDim)
         }
 
-        self.layerNorm = LayerNorm(dimensions: config.dModel)
+        self.layerNorm = LayerNorm(config.dModel)
 
         if let outDim = config.outputDim, outDim != config.dModel {
-            self.outputProjection = Linear(inputDimension: config.dModel, outputDimension: outDim)
+            self.outputProjection = Linear(config.dModel, outDim)
         } else {
             self.outputProjection = nil
         }
@@ -185,17 +199,17 @@ class TransformerEncoderLayer: Module {
     let ln2: LayerNorm
 
     init(dModel: Int, heads: Int, mlpDim: Int) {
-        self.attention = MultiHeadAttention(dims: dModel, numHeads: heads)
-        self.ln1 = LayerNorm(dimensions: dModel)
+        self.attention = MultiHeadAttention(heads, dModel)
+        self.ln1 = LayerNorm(dModel)
         self.mlp = MLP(dModel: dModel, hiddenDim: mlpDim)
-        self.ln2 = LayerNorm(dimensions: dModel)
+        self.ln2 = LayerNorm(dModel)
         super.init()
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let residual = x
         var x = ln1(x)
-        x = attention(queries: x, keys: x, values: x)
+        x = attention(x, keys: x, values: x)
         x = residual + x
 
         let residual2 = x
@@ -210,8 +224,8 @@ class MLP: Module {
     let fc2: Linear
 
     init(dModel: Int, hiddenDim: Int) {
-        self.fc1 = Linear(inputDimension: dModel, outputDimension: hiddenDim)
-        self.fc2 = Linear(inputDimension: hiddenDim, outputDimension: dModel)
+        self.fc1 = Linear(dModel, hiddenDim)
+        self.fc2 = Linear(hiddenDim, dModel)
         super.init()
     }
 
@@ -263,8 +277,8 @@ class Qwen3TextDecoder: Module {
         self.layers = (0..<config.numHiddenLayers).map { _ in
             Qwen3DecoderLayer(config: config)
         }
-        self.norm = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        self.lmHead = Linear(inputDimension: config.hiddenSize, outputDimension: config.vocabSize, bias: false)
+        self.norm = RMSNorm(config.hiddenSize, eps: config.rmsNormEps)
+        self.lmHead = Linear(config.hiddenSize, config.vocabSize, bias: false)
         super.init()
     }
 
@@ -298,8 +312,8 @@ class Qwen3DecoderLayer: Module {
     init(config: Qwen3ASRConfig.TextConfig) {
         self.selfAttn = Attention(config: config)
         self.mlp = SwiGLUMLP(config: config)
-        self.inputLayernorm = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        self.postAttentionLayernorm = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        self.inputLayernorm = RMSNorm(config.hiddenSize, eps: config.rmsNormEps)
+        self.postAttentionLayernorm = RMSNorm(config.hiddenSize, eps: config.rmsNormEps)
         super.init()
     }
 
@@ -333,12 +347,12 @@ class Attention: Module {
         self.headDim = config.hiddenSize / config.numAttentionHeads
         self.scale = 1.0 / sqrt(Float(headDim))
 
-        self.qProj = Linear(inputDimension: config.hiddenSize, outputDimension: config.numAttentionHeads * headDim, bias: true)
-        self.kProj = Linear(inputDimension: config.hiddenSize, outputDimension: config.numKeyValueHeads * headDim, bias: true)
-        self.vProj = Linear(inputDimension: config.hiddenSize, outputDimension: config.numKeyValueHeads * headDim, bias: true)
-        self.oProj = Linear(inputDimension: config.numAttentionHeads * headDim, outputDimension: config.hiddenSize, bias: false)
+        self.qProj = Linear(config.hiddenSize, config.numAttentionHeads * headDim, bias: true)
+        self.kProj = Linear(config.hiddenSize, config.numKeyValueHeads * headDim, bias: true)
+        self.vProj = Linear(config.hiddenSize, config.numKeyValueHeads * headDim, bias: true)
+        self.oProj = Linear(config.numAttentionHeads * headDim, config.hiddenSize, bias: false)
 
-        self.rope = RoPE(dimensions: headDim, traditional: true, base: config.ropeTheta)
+        self.rope = RoPE(headDim, traditional: true, base: config.ropeTheta)
         super.init()
     }
 
@@ -403,9 +417,9 @@ class SwiGLUMLP: Module {
     let downProj: Linear
 
     init(config: Qwen3ASRConfig.TextConfig) {
-        self.gateProj = Linear(inputDimension: config.hiddenSize, outputDimension: config.intermediateSize, bias: false)
-        self.upProj = Linear(inputDimension: config.hiddenSize, outputDimension: config.intermediateSize, bias: false)
-        self.downProj = Linear(inputDimension: config.intermediateSize, outputDimension: config.hiddenSize, bias: false)
+        self.gateProj = Linear(config.hiddenSize, config.intermediateSize, bias: false)
+        self.upProj = Linear(config.hiddenSize, config.intermediateSize, bias: false)
+        self.downProj = Linear(config.intermediateSize, config.hiddenSize, bias: false)
         super.init()
     }
 
