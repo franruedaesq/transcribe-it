@@ -1,6 +1,8 @@
 import Foundation
+#if canImport(MLX)
 import MLX
 import MLXNN
+#endif
 
 // MARK: - Configuration
 
@@ -54,6 +56,7 @@ struct Qwen3ASRConfig: Codable {
 
 // MARK: - Model Architecture
 
+#if canImport(MLX)
 class Qwen3ASR: ObservableObject {
     var audioEncoder: Qwen3ASRAudioEncoder?
     var textDecoder: Qwen3TextDecoder?
@@ -89,7 +92,7 @@ class Qwen3ASR: ObservableObject {
         // Assuming simple case: Audio Embeddings -> Decoder.
 
         var currentEmbeddings = audioEmbeddings
-        var currentIds: [Int] = [] // Initial prompt tokens if any
+        // var currentIds: [Int] = [] // Initial prompt tokens if any
 
         // If we had input IDs, we would convert to embeddings:
         // let initialTextEmbeddings = textDecoder.embedTokens(MLXArray(currentIds)[0.reshaped(1, -1)])
@@ -410,3 +413,9 @@ class SwiGLUMLP: Module {
         return downProj(silu(gateProj(x)) * upProj(x))
     }
 }
+#else
+class Qwen3ASR: ObservableObject {
+    func load(configPath: URL, weightsPath: URL) async throws {}
+    func transcribe(audioFeatures: Any, tokenizer: Tokenizer) -> String { return "MLX not imported" }
+}
+#endif
