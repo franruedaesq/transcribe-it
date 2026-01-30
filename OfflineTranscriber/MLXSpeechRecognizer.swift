@@ -1,8 +1,10 @@
 import Foundation
 import AVFoundation
 import Accelerate
+#if canImport(MLX)
 import MLX
 import MLXNN
+#endif
 
 class MLXSpeechRecognizer: ObservableObject {
     @Published var transcript: String = ""
@@ -35,6 +37,13 @@ class MLXSpeechRecognizer: ObservableObject {
 
     func loadModel() async {
         do {
+            #if !canImport(MLX)
+            await MainActor.run {
+                self.errorMessage = "MLX Framework not found. Please add mlx-swift package dependency in Xcode."
+            }
+            return
+            #else
+
             // These files must be added to the App Bundle
             guard let modelUrl = Bundle.main.url(forResource: "model", withExtension: "safetensors"),
                   let configUrl = Bundle.main.url(forResource: "config", withExtension: "json"),
@@ -58,12 +67,18 @@ class MLXSpeechRecognizer: ObservableObject {
                 self.isModelLoaded = true
                 self.errorMessage = nil
             }
+            #endif
         } catch {
              await MainActor.run { self.errorMessage = "Load failed: \(error.localizedDescription)" }
         }
     }
 
     func startRecording() {
+        #if !canImport(MLX)
+        self.errorMessage = "MLX Framework missing."
+        return
+        #endif
+
         guard isModelLoaded else {
             self.errorMessage = "Model is not loaded."
             return
@@ -120,6 +135,7 @@ class MLXSpeechRecognizer: ObservableObject {
     }
 
     func transcribe() async {
+        #if canImport(MLX)
         guard let model = model, let tokenizer = tokenizer else { return }
 
         // 1. Process Audio to Mel Spectrogram
@@ -132,8 +148,15 @@ class MLXSpeechRecognizer: ObservableObject {
             self.transcript = text
             self.isProcessing = false
         }
+        #else
+        await MainActor.run {
+            self.errorMessage = "MLX Framework not found."
+            self.isProcessing = false
+        }
+        #endif
     }
 
+    #if canImport(MLX)
     private func computeLogMelSpectrogram(audio: [Float]) -> MLXArray {
         // IMPORTANT: Real Mel Spectrogram calculation requires FFT and Mel Filterbank.
         // Implementing this from scratch in a single file is too large for this context.
@@ -150,4 +173,5 @@ class MLXSpeechRecognizer: ObservableObject {
 
         return MLXArray.zeros([1, validTimeSteps, nMels])
     }
+    #endif
 }
